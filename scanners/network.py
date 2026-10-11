@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from pathlib import Path
+from typing import Iterable
+
+from .base import (
+    ASSET_ALGORITHM,
+    ASSET_CERTIFICATE,
+    ASSET_PROTOCOL,
+    SOURCE_NETWORK,
+    BaseScanner,
+    Finding,
+)
+
+TLS_GROUPS = {
+    0x0017: "secp256r1",
+    0x0018: "secp384r1",
+    0x0019: "secp521r1",
+    0x001D: "x25519",
+    0x001E: "x448",
+    0x0100: "ffdhe2048",
+    0x0101: "ffdhe3072",
+    0x0102: "ffdhe4096",
+    0x0200: "MLKEM512",
+    0x0201: "MLKEM768",
+    0x0202: "MLKEM1024",
+    0x11EB: "SecP256r1MLKEM768",
+    0x11EC: "X25519MLKEM768",
+    0x11ED: "SecP384r1MLKEM1024",
+    0x6399: "X25519Kyber768Draft00",
+}
+PQC_GROUPS = {n for n in TLS_GROUPS.values() if "MLKEM" in n or "Kyber" in n}
+TLS_VERSIONS = {0x0301: "TLS1.0", 0x0302: "TLS1.1", 0x0303: "TLS1.2", 0x0304: "TLS1.3"}
+HNDL_BYTES_THRESHOLD = 1_000_000
+
+
+def parse_cipher_suite(name: str) -> dict:
+    n = name.upper().replace("TLS_", "", 1)
+    out = {"kex": None, "auth": None, "cipher": None, "mac": None}
+    if "_WITH_" in n:
+        left, right = n.split("_WITH_", 1)
+        parts = left.split("_")
+        out["kex"] = parts[0]
+        out["auth"] = parts[1] if len(parts) > 1 else parts[0]
+    else:
+        right = n
+    tokens = right.split("_")
+    out["mac"] = tokens[-1] if tokens[-1].startswith("SHA") else None
+    out["cipher"] = "_".join(tokens[:-1] if out["mac"] else tokens)
+    return out
+
+
+class NetworkScanner(BaseScanner):
+    name = "network"
+    source = SOURCE_NETWORK
+    extensions = (".pcap", ".pcapng", ".cap")
+
+    def scan_file(self, path: Path) -> Iterable[Finding]:
+        try:
+            from scapy.all import PcapReader, TCP, IP, IPv6, load_layer
+            load_layer("tls")
+            from scapy.layers.tls.record import TLS
+            from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSCertificate
+            from scapy.layers.tls.crypto.suites import _tls_cipher_suites
+        except ImportError as e:
+            raise RuntimeError("Install scapy and cryptography: pip install scapy cryptography") from e
+
+        sessions: dict[tuple, dict] = defaultdict(lambda: {"bytes": 0, "kex": set(), "groups": set()})
+        findings: list[Finding] = []
+
+        with PcapReader(str(path)) as reader:
+            for pkt in reader:
+                if TCP not in pkt:
+                    continue
+                ipl = pkt[IP] if IP in pkt else (pkt[IPv6] if IPv6 in pkt else None)
+                if ipl is None:
+                    continue
+                a, b = (ipl.src, pkt[TCP].sport), (ipl.dst, pkt[TCP].dport)
+                sess_key = tuple(sorted([a, b]))
+                sess = sessions[sess_key]
+                sess["bytes"] += len(pkt[TCP].payload)
+                server = f"{b[0]}:{b[1]}" if b[1] in (443, 8443) or b[1] < a[1] else f"{a[0]}:{a[1]}"
+
+                if not pkt.haslayer(TLS):
+                    continue
+
+                if pkt.haslayer(TLSClientHello):
+                    ch = pkt[TLSClientHello]
+                    for ext in getattr(ch, "ext", None) or []:
+                        groups = getattr(ext, "groups", None)
+                        if groups:
+                            for g in groups:
+                                gname = TLS_GROUPS.get(int(g), f"0x{int(g):04x}")
+                                sess["groups"].add(gname)
+                                findings.append(Finding(
+                                    source=self.source,
+                                    asset_type=ASSET_ALGORITHM,
+                                    algorithm=gname,
+                                    primitive="kem" if gname in PQC_GROUPS else "key-agree",
+                                    location=server,
+                                    raw=f"supported_group={gname}",
+                                    context={"pcap": path.name, "frame": "ClientHello"},
+                                ))
+
+                if pkt.haslayer(TLSServerHello):
+                    sh = pkt[TLSServerHello]
+                    cs = _tls_cipher_suites.get(sh.cipher, f"0x{sh.cipher:04x}")
+                    version = TLS_VERSIONS.get(sh.version, hex(sh.version))
+                    for ext in getattr(sh, "ext", None) or []:
+                        if hasattr(ext, "version"):
+                            version = TLS_VERSIONS.get(ext.version, version)
+                        ks = getattr(ext, "server_share", None)
+                        if ks is not None and hasattr(ks, "group"):
+                            g = TLS_GROUPS.get(int(ks.group), hex(int(ks.group)))
+                            sess["kex"].add(g)
+                    parsed = parse_cipher_suite(cs)
+                    if parsed["kex"]:
+                        sess["kex"].add(parsed["kex"])
+                    findings.append(Finding(
+                        source=self.source,
+                        asset_type=ASSET_PROTOCOL,
+                        algorithm=version,
+                        location=server,
+                        raw=cs,
+                        primitive="protocol",
+                        context={"pcap": path.name, "cipher_suite": cs, **parsed},
+                    ))
+                    if parsed["cipher"]:
+                        findings.append(Finding(
+                            source=self.source,
+                            asset_type=ASSET_ALGORITHM,
+                            algorithm=parsed["cipher"].replace("_", "-"),
+                            location=server,
+                            primitive="ae",
+                            raw=cs,
+                            context={"pcap": path.name},
+                        ))
+                    if parsed["kex"]:
+                        findings.append(Finding(
+                            source=self.source,
+                            asset_type=ASSET_ALGORITHM,
+                            algorithm=parsed["kex"],
+                            location=server,
+                            primitive="key-agree",
+                            raw=cs,
+                            context={"pcap": path.name},
+                        ))
+
+                if pkt.haslayer(TLSCertificate):
+                    findings.extend(self._parse_certs(pkt[TLSCertificate], server, path.name))
+
+        for (a, b), s in sessions.items():
+            kex = s["kex"] | s["groups"]
+            if s["bytes"] >= HNDL_BYTES_THRESHOLD and kex and not (kex & PQC_GROUPS):
+                findings.append(Finding(
+                    source=self.source,
+                    asset_type=ASSET_PROTOCOL,
+                    algorithm="HNDL-RISK",
+                    location=f"{a[0]}:{a[1]}<->{b[0]}:{b[1]}",
+                    primitive="key-agree",
+                    raw=",".join(sorted(kex)),
+                    context={"pcap": path.name, "bytes": s["bytes"], "hndl": True},
+                ))
+        return findings
+
+    def _parse_certs(self, layer, server: str, pcap: str) -> list[Finding]:
+        out = []
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives.asymmetric import rsa, ec, ed25519, dsa
+        except ImportError:
+            return out
+        for _, cert in getattr(layer, "certs", []) or []:
+            try:
+                der = bytes(cert.der) if hasattr(cert, "der") else bytes(cert)
+                c = x509.load_der_x509_certificate(der)
+            except Exception:
+                continue
+            pub = c.public_key()
+            alg, size = "UNKNOWN", None
+            if isinstance(pub, rsa.RSAPublicKey):
+                alg, size = "RSA", pub.key_size
+            elif isinstance(pub, ec.EllipticCurvePublicKey):
+                alg, size = "ECDSA", pub.curve.key_size
+            elif isinstance(pub, ed25519.Ed25519PublicKey):
+                alg, size = "Ed25519", 256
+            elif isinstance(pub, dsa.DSAPublicKey):
+                alg, size = "DSA", pub.key_size
+            out.append(Finding(
+                source=self.source,
+                asset_type=ASSET_CERTIFICATE,
+                algorithm=alg,
+                key_size=size,
+                location=server,
+                primitive="signature",
+                raw=c.signature_algorithm_oid._name,
+                context={
+                    "pcap": pcap,
+                    "subject": c.subject.rfc4514_string(),
+                    "issuer": c.issuer.rfc4514_string(),
+                    "not_after": c.not_valid_after_utc.isoformat(),
+                    "signature_algorithm": c.signature_algorithm_oid._name,
+                },
+            ))
+        return out
