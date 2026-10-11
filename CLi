@@ -1,0 +1,167 @@
+"""
+Gravação na BD (clara e rastreável):
+  1. Scans: o documento é criado ANTES de correr (status "running"), para
+     que um scan interrompido fique registado.
+  2. Assets: upsert por fingerprint (sem duplicados entre execuções).
+  3. Scans: fecho com status "completed", findings classificados e um summary
+     completo (score, contagens por tier/fonte, erros, duração, nº de assets
+     gravados). Qualquer exceção fecha o scan como "failed" com a mensagem.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from classifier import classify_all
+from scanners import ALL_SCANNERS
+from scoring import breakdown_by_source, compute_score
+
+console = Console()
+TIER_STYLE = {"critical": "bold red", "medium": "yellow", "safe": "green", "unknown": "dim"}
+
+
+def run_scanners(target: Path, sources: list[str]):
+    findings, errors = [], []
+    for name in sources:
+        with console.status(f"A correr scanner [bold]{name}[/]..."):
+            scanner = ALL_SCANNERS[name](target)
+            found = scanner.scan()
+        findings.extend(found)
+        errors.extend(f"[{name}] {e}" for e in scanner.errors)
+        console.print(f"  [cyan]{name}[/]: {len(found)} findings, {len(scanner.errors)} erros")
+    return findings, errors
+
+
+def build_summary(findings, errors, duration_s: float, assets_written: int | None) -> dict:
+    dicts = [f.to_dict() for f in findings]
+    return {
+        **compute_score(dicts),                     # score, grade, label, total_assets, counts
+        "by_source": breakdown_by_source(dicts),
+        "findings_per_source": dict(Counter(f.source for f in findings)),
+        "errors": errors,
+        "error_count": len(errors),
+        "duration_seconds": round(duration_s, 2),
+        "assets_written": assets_written,
+    }
+
+
+def print_report(findings, summary):
+    table = Table(title="Findings", show_lines=False)
+    for col in ("Tier", "Fonte", "Algoritmo", "Chave", "Localização", "Migração NIST"):
+        table.add_column(col)
+    order = {"critical": 0, "medium": 1, "unknown": 2, "safe": 3}
+    for f in sorted(findings, key=lambda x: order.get(x.risk_tier or "unknown", 2)):
+        tier = f.risk_tier or "unknown"
+        table.add_row(f"[{TIER_STYLE[tier]}]{tier}[/]", f.source, f.algorithm,
+                      str(f.key_size or "-"), f.location, f.nist_migration or "-")
+    console.print(table)
+
+    c = summary["counts"]
+    console.print(Panel.fit(
+        f"[bold]Quantum Risk Score: {summary['score']}/100  (nota {summary['grade']})[/]\n"
+        f"{summary['label']}\n\n"
+        f"[red]critical {c['critical']}[/]  [yellow]medium {c['medium']}[/]  "
+        f"[green]safe {c['safe']}[/]  [dim]unknown {c['unknown']}[/]\n"
+        f"Duração: {summary['duration_seconds']}s  |  Erros: {summary['error_count']}",
+        title="Resumo",
+    ))
+    for e in summary["errors"][:10]:
+        console.print(f"[dim red]  ! {e}[/]")
+
+
+def cmd_scan(args) -> int:
+    target = Path(args.target)
+    if not target.exists():
+        console.print(f"[red]Alvo não existe:[/] {target}")
+        return 2
+
+    db = scan_id = None
+    if not args.no_db:
+        import db as dbmod
+        db = dbmod.get_db(dbmod.get_client(args.mongo_uri))
+        dbmod.ensure_indexes(db)
+        scan_id = dbmod.start_scan(db, args.sources, str(target.resolve()))
+        console.print(f"[dim]Scan registado em Scans: {scan_id} (status=running)[/]")
+
+    t0 = time.perf_counter()
+    try:
+        findings, errors = run_scanners(target, args.sources)
+        findings = classify_all(findings)
+
+        assets_written = None
+        if db is not None:
+            assets_written = dbmod.upsert_assets(db, findings)
+
+        summary = build_summary(findings, errors, time.perf_counter() - t0, assets_written)
+
+        if db is not None:
+            dbmod.finish_scan(db, scan_id, findings, summary, status="completed")
+            console.print(f"[green]Gravado:[/] Scans/{scan_id} (completed, {len(findings)} findings) "
+                          f"| Assets: {assets_written} inseridos/atualizados")
+
+        print_report(findings, summary)
+
+        if args.cbom:
+            if db is None:
+                from cbom_export import build_cbom
+                import json
+                Path(args.cbom).write_text(json.dumps(build_cbom([f.to_dict() for f in findings]), indent=2))
+            else:
+                from cbom_export import export_cbom_from_db
+                export_cbom_from_db(db, args.cbom)
+            console.print(f"[green]CBOM exportado:[/] {args.cbom}")
+        return 0
+    except BaseException as exc:  # inclui Ctrl+C: o scan nunca fica "running" para sempre
+        if db is not None:
+            dbmod.finish_scan(db, scan_id, [], {
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_seconds": round(time.perf_counter() - t0, 2),
+            }, status="failed")
+            console.print(f"[red]Scan {scan_id} gravado como failed[/]")
+        raise
+
+
+def cmd_history(args) -> int:
+    import db as dbmod
+    db = dbmod.get_db(dbmod.get_client(args.mongo_uri))
+    table = Table(title="Últimos scans")
+    for col in ("ID", "Início", "Status", "Fontes", "Score", "Findings"):
+        table.add_column(col)
+    for s in dbmod.get_scans(db, limit=args.limit):
+        summ = s.get("summary") or {}
+        table.add_row(str(s["_id"]), str(s.get("started_at", ""))[:19], s.get("status", ""),
+                      ",".join(s.get("sources", [])), str(summ.get("score", "-")),
+                      str(len(s.get("findings", []))))
+    console.print(table)
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="quantum-scanner")
+    p.add_argument("--mongo-uri", default=None, help="Por defeito usa MONGO_URI ou localhost")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("scan", help="Analisa um ficheiro/pasta")
+    s.add_argument("target")
+    s.add_argument("--sources", nargs="+", choices=list(ALL_SCANNERS), default=list(ALL_SCANNERS))
+    s.add_argument("--no-db", action="store_true", help="Não grava no MongoDB")
+    s.add_argument("--cbom", metavar="FICHEIRO", help="Exporta CBOM CycloneDX 1.6")
+    s.set_defaults(func=cmd_scan)
+
+    h = sub.add_parser("history", help="Lista scans gravados")
+    h.add_argument("--limit", type=int, default=20)
+    h.set_defaults(func=cmd_history)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

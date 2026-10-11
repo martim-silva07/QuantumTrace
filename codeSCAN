@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+from typing import Iterable
+
+from .base import ASSET_ALGORITHM, ASSET_KEY, SOURCE_CODE, BaseScanner, Finding
+
+# ---------- Imports de bibliotecas cripto ----------
+LIB_PATTERNS = {
+    ".py":   re.compile(r"^\s*(?:from|import)\s+(Crypto|Cryptodome|cryptography|hashlib|ssl|nacl|rsa|ecdsa|OpenSSL|oqs)\b", re.M),
+    ".java": re.compile(r"^\s*import\s+(javax\.crypto|java\.security|org\.bouncycastle|javax\.net\.ssl)[\w.*]*;", re.M),
+    ".go":   re.compile(r'"(crypto/[\w/]+|golang\.org/x/crypto/[\w/]+|github\.com/cloudflare/circl/[\w/]+)"'),
+    ".c":    re.compile(r"#\s*include\s*[<\"](openssl/\w+\.h|sodium\.h|mbedtls/\w+\.h|oqs/\w+\.h)[>\"]"),
+}
+for ext in (".h", ".cpp", ".cc", ".hpp", ".cxx"):
+    LIB_PATTERNS[ext] = LIB_PATTERNS[".c"]
+
+# ---------- Chamadas / parâmetros (regex, todas as linguagens) ----------
+# (regex, função que devolve dict com algorithm/key_size/mode/primitive)
+def _transform(m: re.Match) -> dict:
+    alg, mode, pad = m.group(1), m.group(2), m.group(3)
+    return {"algorithm": alg.upper(), "mode": mode, "primitive": "block-cipher" if mode else None,
+            "context": {"padding": pad}}
+
+CALL_RULES: list[tuple[re.Pattern, callable]] = [
+    # Java: Cipher.getInstance("AES/CBC/PKCS5Padding")
+    (re.compile(r'Cipher\.getInstance\(\s*"([A-Za-z0-9]+)(?:/([A-Za-z0-9]+))?(?:/([A-Za-z0-9]+))?"'), _transform),
+    # Java: KeyGenerator / KeyPairGenerator / Signature / MessageDigest / KeyAgreement
+    (re.compile(r'KeyPairGenerator\.getInstance\(\s*"(\w+)"'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "pke"}),
+    (re.compile(r'KeyGenerator\.getInstance\(\s*"(\w+)"'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "block-cipher"}),
+    (re.compile(r'Signature\.getInstance\(\s*"([\w-]+)"'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "signature"}),
+    (re.compile(r'MessageDigest\.getInstance\(\s*"([\w-]+)"'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "hash"}),
+    (re.compile(r'KeyAgreement\.getInstance\(\s*"(\w+)"'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "key-agree"}),
+    (re.compile(r'\.initialize\(\s*(\d{3,5})'), lambda m: {"algorithm": "KEYSIZE", "key_size": int(m.group(1))}),
+    # Go
+    (re.compile(r'rsa\.GenerateKey\([^,]+,\s*(\d+)'), lambda m: {"algorithm": "RSA", "key_size": int(m.group(1)), "primitive": "pke"}),
+    (re.compile(r'ecdsa\.GenerateKey\(\s*elliptic\.P(\d+)'), lambda m: {"algorithm": "ECDSA", "key_size": int(m.group(1)), "primitive": "signature"}),
+    (re.compile(r'ed25519\.GenerateKey'), lambda m: {"algorithm": "Ed25519", "key_size": 256, "primitive": "signature"}),
+    (re.compile(r'ecdh\.(X25519|P256|P384|P521)\(\)'), lambda m: {"algorithm": "ECDH", "primitive": "key-agree", "context": {"curve": m.group(1)}}),
+    (re.compile(r'(md5|sha1|sha256|sha512)\.(?:New|Sum\w*)\('), lambda m: {"algorithm": m.group(1).upper(), "primitive": "hash"}),
+    (re.compile(r'mlkem\.GenerateKey(768|1024)'), lambda m: {"algorithm": f"ML-KEM-{m.group(1)}", "primitive": "kem"}),
+    (re.compile(r'tls\.(TLS_[A-Z0-9_]+)'), lambda m: {"algorithm": m.group(1), "primitive": "protocol"}),
+    (re.compile(r'MinVersion:\s*tls\.Version(TLS\d+)'), lambda m: {"algorithm": m.group(1), "primitive": "protocol"}),
+    # C / OpenSSL
+    (re.compile(r'RSA_generate_key(?:_ex)?\([^,]*?,?\s*(\d{3,5})'), lambda m: {"algorithm": "RSA", "key_size": int(m.group(1)), "primitive": "pke"}),
+    (re.compile(r'EVP_PKEY_CTX_set_rsa_keygen_bits\([^,]+,\s*(\d+)'), lambda m: {"algorithm": "RSA", "key_size": int(m.group(1)), "primitive": "pke"}),
+    (re.compile(r'EVP_(aes|des|chacha20|camellia)_?(\d+)?_?(\w+)?\(\)', re.I),
+     lambda m: {"algorithm": f"{m.group(1).upper()}{'-' + m.group(2) if m.group(2) else ''}", "key_size": int(m.group(2)) if m.group(2) else None,
+                "mode": (m.group(3) or "").upper() or None, "primitive": "block-cipher"}),
+    (re.compile(r'EVP_(md5|sha1|sha256|sha384|sha512)\(\)'), lambda m: {"algorithm": m.group(1).upper(), "primitive": "hash"}),
+    (re.compile(r'\b(DSA|DH|EC_KEY|ECDSA)_(?:generate|new|sign)'), lambda m: {"algorithm": m.group(1).replace("EC_KEY", "EC"), "primitive": "pke"}),
+    (re.compile(r'SSL_CTX_set_cipher_list\([^,]+,\s*"([^"]+)"'), lambda m: {"algorithm": "CIPHER_POLICY", "primitive": "protocol", "context": {"policy": m.group(1)}}),
+]
+
+PY_HASHLIB = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha3_256", "sha3_512", "blake2b"}
+
+
+class CodeScanner(BaseScanner):
+    name = "code"
+    source = SOURCE_CODE
+    extensions = tuple(LIB_PATTERNS.keys())
+
+    def scan_file(self, path: Path) -> Iterable[Finding]:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        ext = path.suffix.lower()
+        lines = text.splitlines()
+
+        # 1) imports de bibliotecas
+        pat = LIB_PATTERNS.get(ext)
+        if pat:
+            for m in pat.finditer(text):
+                ln = text.count("\n", 0, m.start()) + 1
+                yield Finding(source=self.source, asset_type="library", algorithm=m.group(1),
+                              location=f"{path}:{ln}", raw=lines[ln - 1].strip(),
+                              context={"language": ext.lstrip("."), "kind": "import"})
+
+        # 2) Python: AST
+        if ext == ".py":
+            yield from self._scan_python_ast(path, text, lines)
+
+        # 3) regex genéricas
+        for rx, fn in CALL_RULES:
+            for m in rx.finditer(text):
+                ln = text.count("\n", 0, m.start()) + 1
+                info = fn(m)
+                yield Finding(
+                    source=self.source,
+                    asset_type=ASSET_KEY if info.get("key_size") and info["algorithm"] == "KEYSIZE" else ASSET_ALGORITHM,
+                    algorithm=info["algorithm"], key_size=info.get("key_size"),
+                    mode=info.get("mode"), primitive=info.get("primitive"),
+                    location=f"{path}:{ln}", raw=lines[ln - 1].strip()[:200],
+                    context={"language": ext.lstrip("."), **info.get("context", {})},
+                )
+
+    # ---------- Python AST ----------
+    def _scan_python_ast(self, path: Path, text: str, lines: list[str]) -> Iterable[Finding]:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _call_name(node.func)
+            if not name:
+                continue
+            loc = f"{path}:{node.lineno}"
+            raw = lines[node.lineno - 1].strip()[:200]
+            kw = {k.arg: _const(k.value) for k in node.keywords if k.arg}
+            last = name.split(".")[-1]
+
+            def F(alg, primitive, key_size=None, mode=None, **ctx):
+                return Finding(source=self.source, asset_type=ASSET_ALGORITHM, algorithm=alg,
+                               key_size=key_size, mode=mode, primitive=primitive,
+                               location=loc, raw=raw, context={"language": "py", "call": name, **ctx})
+
+            # cryptography: rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            if name.endswith("rsa.generate_private_key"):
+                yield F("RSA", "pke", key_size=kw.get("key_size"))
+            elif name.endswith("dsa.generate_private_key"):
+                yield F("DSA", "signature", key_size=kw.get("key_size"))
+            elif name.endswith("ec.generate_private_key"):
+                curve = _call_name(node.args[0].func) if node.args and isinstance(node.args[0], ast.Call) else (kw.get("curve") or "")
+                yield F("ECDSA", "signature", key_size=_curve_bits(str(curve)), curve=str(curve))
+            elif name.endswith(("Ed25519PrivateKey.generate", "X25519PrivateKey.generate")):
+                yield F("Ed25519" if "Ed" in name else "X25519", "signature" if "Ed" in name else "key-agree", key_size=256)
+            # cryptography: Cipher(algorithms.AES(key), modes.CBC(iv))
+            elif last == "Cipher" and node.args:
+                alg = _call_name(node.args[0].func) if isinstance(node.args[0], ast.Call) else None
+                mode = _call_name(node.args[1].func) if len(node.args) > 1 and isinstance(node.args[1], ast.Call) else None
+                if alg:
+                    yield F(alg.split(".")[-1].upper(), "block-cipher",
+                            mode=mode.split(".")[-1].upper() if mode else None)
+            # pycryptodome: RSA.generate(2048), AES.new(key, AES.MODE_CBC)
+            elif name in ("RSA.generate", "DSA.generate"):
+                ks = _const(node.args[0]) if node.args else kw.get("bits")
+                yield F(name.split(".")[0], "pke", key_size=ks)
+            elif name == "ECC.generate":
+                yield F("ECDSA", "signature", key_size=_curve_bits(str(kw.get("curve", ""))), curve=kw.get("curve"))
+            elif last == "new" and name.split(".")[0] in {"AES", "DES", "DES3", "ARC4", "Blowfish", "ChaCha20"}:
+                mode = None
+                if len(node.args) > 1 and isinstance(node.args[1], ast.Attribute):
+                    mode = node.args[1].attr.replace("MODE_", "")
+                key_len = None
+                yield F(name.split(".")[0].replace("DES3", "3DES"), "block-cipher", key_size=key_len, mode=mode)
+            # hashlib.md5(), hashlib.new("sha1")
+            elif name.startswith("hashlib."):
+                h = last if last in PY_HASHLIB else (_const(node.args[0]) if last == "new" and node.args else None)
+                if h:
+                    yield F(str(h).upper().replace("_", "-"), "hash")
+            # hashes.SHA1() da lib cryptography
+            elif name.startswith("hashes.") and last.upper().startswith(("SHA", "MD5")):
+                yield F(last.upper(), "hash")
+            # ssl
+            elif name.endswith("set_ciphers") and node.args:
+                yield F("CIPHER_POLICY", "protocol", policy=_const(node.args[0]))
+            # liboqs: oqs.KeyEncapsulation("ML-KEM-768")
+            elif name in ("oqs.KeyEncapsulation", "oqs.Signature") and node.args:
+                yield F(str(_const(node.args[0])), "kem" if "Encap" in name else "signature")
+
+
+def _call_name(func) -> str | None:
+    parts = []
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
+    if isinstance(func, ast.Name):
+        parts.append(func.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _const(node):
+    return node.value if isinstance(node, ast.Constant) else None
+
+
+def _curve_bits(curve: str) -> int | None:
+    m = re.search(r"(\d{3})", curve)
+    return int(m.group(1)) if m else None

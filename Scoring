@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from typing import Any
+
+TIER_WEIGHTS = {
+    "critical": 10,
+    "medium": 4,
+    "unknown": 2,
+    "safe": 0,
+}
+
+GRADES = [
+    (80, "F", "Risco quântico severo — migração urgente"),
+    (60, "D", "Risco elevado — planear migração a curto prazo"),
+    (40, "C", "Risco moderado — incluir no roadmap de migração"),
+    (20, "B", "Risco baixo — boa postura, manter vigilância"),
+    (0,  "A", "Postura forte — maioritariamente pós-quântico/seguro"),
+]
+
+
+def compute_score(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Calcula o score a partir de uma lista de assets (docs da coleção Assets).
+
+    Devolve um dicionário pronto a gravar em Scans.summary ou a mostrar
+    no dashboard.
+    """
+    total = len(assets)
+    counts = {"critical": 0, "medium": 0, "safe": 0, "unknown": 0}
+    for a in assets:
+        tier = a.get("risk_tier") or "unknown"
+        counts[tier if tier in counts else "unknown"] += 1
+
+    if total == 0:
+        return {
+            "score": 0,
+            "grade": "A",
+            "label": "Sem ativos criptográficos detetados",
+            "total_assets": 0,
+            "counts": counts,
+        }
+
+    weighted = sum(counts[t] * w for t, w in TIER_WEIGHTS.items())
+    score = round(100 * weighted / (10 * total))
+
+    grade, label = next((g, l) for threshold, g, l in GRADES if score >= threshold)
+
+    return {
+        "score": score,
+        "grade": grade,
+        "label": label,
+        "total_assets": total,
+        "counts": counts,
+    }
+
+
+def score_from_db(db) -> dict[str, Any]:
+    """Atalho: lê a coleção Assets e calcula o score global do inventário."""
+    from db import ASSETS_COLLECTION
+
+    assets = list(db[ASSETS_COLLECTION].find({}))
+    return compute_score(assets)
+
+
+def breakdown_by_source(assets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Score parcial por vetor (network | code | cloud) — útil para o dashboard."""
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for a in assets:
+        by_source.setdefault(a.get("source", "unknown"), []).append(a)
+    return {src: compute_score(items) for src, items in by_source.items()}

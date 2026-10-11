@@ -1,0 +1,175 @@
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+from pymongo import ASCENDING, MongoClient, UpdateOne
+from pymongo.collection import Collection
+from pymongo.database import Database
+
+from scanners.base import Finding
+
+DB_NAME = "Junctionx"
+SCANS_COLLECTION = "Scans"
+ASSETS_COLLECTION = "Assets"
+
+DEFAULT_URI = "mongodb+srv://Banana:Guilherme2007@junctionx.0yole3c.mongodb.net/"
+
+
+def get_client(uri: str | None = None) -> MongoClient:
+    """Cria o cliente MongoDB. A URI vem do argumento ou de MONGO_URI."""
+    return MongoClient(uri or os.environ.get("MONGO_URI", DEFAULT_URI))
+
+
+def get_db(client: MongoClient) -> Database:
+    return client[DB_NAME]
+
+
+def ensure_indexes(db: Database) -> None:
+    """Índices usados pelas queries do dashboard e do scoring."""
+    scans = db[SCANS_COLLECTION]
+    scans.create_index([("started_at", ASCENDING)])
+    scans.create_index([("status", ASCENDING)])
+
+    assets = db[ASSETS_COLLECTION]
+    assets.create_index([("fingerprint", ASCENDING)], unique=True)
+    assets.create_index([("algorithm", ASCENDING)])
+    assets.create_index([("risk_tier", ASCENDING)])
+    assets.create_index([("source", ASCENDING)])
+
+
+# ---------------------------------------------------------------------------
+# Scans
+# ---------------------------------------------------------------------------
+
+def start_scan(db: Database, sources: list[str], target: str) -> str:
+    """Regista o início de um scan e devolve o scan_id (str do ObjectId)."""
+    doc = {
+        "started_at": datetime.now(timezone.utc),
+        "finished_at": None,
+        "status": "running",          # running | completed | failed
+        "sources": sources,           # ex: ["code", "cloud"]
+        "target": target,             # pasta/ficheiro analisado
+        "findings": [],               # lista de Finding.to_dict()
+        "summary": {},                # preenchido no fim: contagens, risk score
+    }
+    result = db[SCANS_COLLECTION].insert_one(doc)
+    return str(result.inserted_id)
+
+
+def finish_scan(
+    db: Database,
+    scan_id: str,
+    findings: Iterable[Finding],
+    summary: dict[str, Any] | None = None,
+    status: str = "completed",
+) -> None:
+    """Fecha um scan: grava os findings e o resumo (incl. Quantum Risk Score)."""
+    from bson import ObjectId
+
+    docs = [f.to_dict() for f in findings]
+    db[SCANS_COLLECTION].update_one(
+        {"_id": ObjectId(scan_id)},
+        {
+            "$set": {
+                "finished_at": datetime.now(timezone.utc),
+                "status": status,
+                "findings": docs,
+                "summary": summary or {},
+            }
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assets (inventário deduplicado)
+# ---------------------------------------------------------------------------
+
+def upsert_assets(db: Database, findings: Iterable[Finding]) -> int:
+    """Insere/atualiza o inventário de assets a partir dos findings.
+
+    A deduplicação é feita pelo fingerprint: se o mesmo ativo voltar a ser
+    detetado, atualiza-se last_seen e incrementa-se times_seen.
+    Devolve o número de operações executadas.
+    """
+    now = datetime.now(timezone.utc)
+    ops: list[UpdateOne] = []
+    for f in findings:
+        d = f.to_dict()
+        fp = d.pop("fingerprint")
+        ops.append(
+            UpdateOne(
+                {"fingerprint": fp},
+                {
+                    "$setOnInsert": {**d, "fingerprint": fp, "first_seen": now},
+                    "$set": {
+                        "last_seen": now,
+                        "risk_tier": d.get("risk_tier"),
+                        "nist_migration": d.get("nist_migration"),
+                    },
+                    "$inc": {"times_seen": 1},
+                },
+                upsert=True,
+            )
+        )
+    if not ops:
+        return 0
+    result = db[ASSETS_COLLECTION].bulk_write(ops, ordered=False)
+    return result.upserted_count + result.modified_count
+
+
+# ---------------------------------------------------------------------------
+# Queries (usadas por scoring.py, cbom_export.py e dashboard.py)
+# ---------------------------------------------------------------------------
+
+def get_assets(
+    db: Database,
+    risk_tier: str | None = None,
+    source: str | None = None,
+    algorithm: str | None = None,
+) -> list[dict[str, Any]]:
+    """Lista assets do inventário, com filtros opcionais."""
+    query: dict[str, Any] = {}
+    if risk_tier:
+        query["risk_tier"] = risk_tier
+    if source:
+        query["source"] = source
+    if algorithm:
+        query["algorithm"] = algorithm
+    return list(db[ASSETS_COLLECTION].find(query))
+
+
+def count_by_risk_tier(db: Database) -> dict[str, int]:
+    """Contagem de assets por risk tier — base do Quantum Risk Score."""
+    pipeline = [
+        {"$group": {"_id": "$risk_tier", "count": {"$sum": 1}}},
+    ]
+    return {r["_id"] or "unknown": r["count"] for r in db[ASSETS_COLLECTION].aggregate(pipeline)}
+
+
+def count_by_algorithm(db: Database) -> list[dict[str, Any]]:
+    """Contagem por algoritmo, ordenada da mais frequente para a menos."""
+    pipeline = [
+        {"$group": {"_id": "$algorithm", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]
+    return [{"algorithm": r["_id"], "count": r["count"]} for r in db[ASSETS_COLLECTION].aggregate(pipeline)]
+
+
+def get_scans(db: Database, limit: int = 20) -> list[dict[str, Any]]:
+    """Últimos scans executados (sem a lista de findings, que é pesada)."""
+    return list(
+        db[SCANS_COLLECTION]
+        .find({}, {"findings": 0})
+        .sort("started_at", -1)
+        .limit(limit)
+    )
+
+
+def get_scan(db: Database, scan_id: str) -> dict[str, Any] | None:
+    """Um scan completo, findings incluídos."""
+    from bson import ObjectId
+
+    return db[SCANS_COLLECTION].find_one({"_id": ObjectId(scan_id)})

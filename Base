@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+# Vetores de origem (Stage 1)
+SOURCE_NETWORK = "network"
+SOURCE_CODE = "code"
+SOURCE_CLOUD = "cloud"
+
+# Tipos de asset (alinhados com CycloneDX 1.6 cryptoProperties.assetType / primitive)
+ASSET_ALGORITHM = "algorithm"
+ASSET_CERTIFICATE = "certificate"
+ASSET_KEY = "related-crypto-material"
+ASSET_PROTOCOL = "protocol"
+
+
+@dataclass
+class Finding:
+    """Uma ocorrência de criptografia detetada num dos 3 vetores."""
+
+    source: str                      # network | code | cloud
+    asset_type: str                  # algorithm | certificate | related-crypto-material | protocol
+    algorithm: str                   # nome normalizado, ex: "RSA", "AES-128-GCM", "X25519MLKEM768"
+    location: str                    # ficheiro:linha, ip:porta, recurso cloud...
+    key_size: int | None = None
+    mode: str | None = None          # GCM, CBC, ...
+    primitive: str | None = None     # pke, signature, kem, ae, block-cipher, hash, key-agree...
+    raw: str | None = None           # string original (cipher suite, linha de código...)
+    context: dict[str, Any] = field(default_factory=dict)
+    # preenchidos mais tarde por classifier.py
+    risk_tier: str | None = None     # critical | medium | safe | unknown
+    nist_migration: str | None = None
+    detected_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    @property
+    def fingerprint(self) -> str:
+        """ID estável para deduplicar a mesma ocorrência entre execuções."""
+        key = f"{self.source}|{self.asset_type}|{self.algorithm}|{self.key_size}|{self.mode}|{self.location}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["fingerprint"] = self.fingerprint
+        return d
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
+
+
+class BaseScanner(ABC):
+    """Contrato comum: recebe um caminho (ficheiro ou pasta) e produz Findings."""
+
+    name: str = "base"
+    source: str = ""
+    extensions: tuple[str, ...] = ()
+
+    def __init__(self, target: str | Path):
+        self.target = Path(target)
+        self.errors: list[str] = []
+
+    def iter_files(self) -> Iterator[Path]:
+        if self.target.is_file():
+            yield self.target
+            return
+        for p in self.target.rglob("*"):
+            if p.is_file() and (not self.extensions or p.suffix.lower() in self.extensions):
+                if any(part in {".git", "node_modules", "venv", ".venv", "__pycache__"} for part in p.parts):
+                    continue
+                yield p
+
+    @abstractmethod
+    def scan_file(self, path: Path) -> Iterable[Finding]:
+        ...
+
+    def scan(self) -> list[Finding]:
+        findings: list[Finding] = []
+        seen: set[str] = set()
+        for path in self.iter_files():
+            try:
+                for f in self.scan_file(path):
+                    if f.fingerprint not in seen:
+                        seen.add(f.fingerprint)
+                        findings.append(f)
+            except Exception as exc:  # um ficheiro mau não para o scan
+                self.errors.append(f"{path}: {exc}")
+        return findings

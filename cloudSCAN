@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Iterable
+
+from .base import (
+    ASSET_ALGORITHM, ASSET_CERTIFICATE, ASSET_KEY, ASSET_PROTOCOL, SOURCE_CLOUD,
+    BaseScanner, Finding,
+)
+
+# AWS KMS KeySpec -> (algoritmo, bits, primitive)
+AWS_KEYSPEC = {
+    "RSA_2048": ("RSA", 2048, "pke"), "RSA_3072": ("RSA", 3072, "pke"), "RSA_4096": ("RSA", 4096, "pke"),
+    "ECC_NIST_P256": ("ECDSA", 256, "signature"), "ECC_NIST_P384": ("ECDSA", 384, "signature"),
+    "ECC_NIST_P521": ("ECDSA", 521, "signature"), "ECC_SECG_P256K1": ("ECDSA", 256, "signature"),
+    "SYMMETRIC_DEFAULT": ("AES-256-GCM", 256, "ae"), "HMAC_256": ("HMAC-SHA256", 256, "mac"),
+    "HMAC_512": ("HMAC-SHA512", 512, "mac"), "ML_DSA_44": ("ML-DSA-44", None, "signature"),
+    "ML_DSA_65": ("ML-DSA-65", None, "signature"), "ML_DSA_87": ("ML-DSA-87", None, "signature"),
+}
+# GCP KMS algorithm enum -> parse genérico
+GCP_RX = re.compile(r"^(RSA|EC|GOOGLE_SYMMETRIC|HMAC|PQ)_?(SIGN|DECRYPT|ENCRYPTION)?_?(\w+)?$")
+# Azure: kty + key_size/crv
+AZURE_KTY = {"RSA": "RSA", "RSA-HSM": "RSA", "EC": "ECDSA", "EC-HSM": "ECDSA", "oct": "AES", "oct-HSM": "AES"}
+
+
+class CloudScanner(BaseScanner):
+    name = "cloud"
+    source = SOURCE_CLOUD
+    extensions = (".json", ".yaml", ".yml", ".conf", ".cfg", ".tf")
+
+    def scan_file(self, path: Path) -> Iterable[Finding]:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        ext = path.suffix.lower()
+        if ext in (".conf", ".cfg") or "nginx" in path.name or "haproxy" in path.name:
+            yield from self._scan_proxy_conf(path, text)
+            return
+        data = self._load(text, ext)
+        if data is None:
+            return
+        yield from self._walk(data, path, "$")
+
+    @staticmethod
+    def _load(text: str, ext: str) -> Any:
+        if ext == ".json":
+            return json.loads(text)
+        if ext in (".yaml", ".yml"):
+            import yaml  # pip install pyyaml
+            docs = list(yaml.safe_load_all(text))
+            return docs[0] if len(docs) == 1 else docs
+        return None
+
+    # ---------- percorre JSON/YAML recursivamente ----------
+    def _walk(self, node: Any, path: Path, jp: str) -> Iterable[Finding]:
+        if isinstance(node, dict):
+            yield from self._match_dict(node, path, jp)
+            for k, v in node.items():
+                yield from self._walk(v, path, f"{jp}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from self._walk(v, path, f"{jp}[{i}]")
+
+    def _match_dict(self, d: dict, path: Path, jp: str) -> Iterable[Finding]:
+        loc = f"{path}#{jp}"
+        rid = d.get("KeyId") or d.get("Arn") or d.get("name") or d.get("kid") or d.get("id")
+        ctx = {"resource": rid, "file": path.name}
+
+        # AWS KMS (describe-key / list-keys dump)
+        spec = d.get("KeySpec") or d.get("CustomerMasterKeySpec")
+        if isinstance(spec, str) and spec in AWS_KEYSPEC:
+            alg, bits, prim = AWS_KEYSPEC[spec]
+            yield Finding(self.source, ASSET_KEY, alg, loc, key_size=bits, primitive=prim, raw=spec,
+                          context={**ctx, "provider": "aws-kms", "usage": d.get("KeyUsage"),
+                                   "state": d.get("KeyState")})
+
+        # GCP KMS (cryptoKeys / versionTemplate.algorithm)
+        galg = d.get("algorithm")
+        if isinstance(galg, str) and GCP_RX.match(galg) and ("protectionLevel" in d or "_" in galg):
+            alg, bits, prim = _parse_gcp(galg)
+            yield Finding(self.source, ASSET_KEY, alg, loc, key_size=bits, primitive=prim, raw=galg,
+                          context={**ctx, "provider": "gcp-kms", "protection": d.get("protectionLevel")})
+
+        # Azure Key Vault (az keyvault key show -> key.kty / attributes)
+        kty = d.get("kty")
+        if isinstance(kty, str) and kty in AZURE_KTY:
+            bits = d.get("key_size") or d.get("keySize")
+            crv = d.get("crv") or d.get("curveName")
+            if not bits and crv:
+                m = re.search(r"(\d{3})", str(crv))
+                bits = int(m.group(1)) if m else None
+            if not bits and d.get("n"):
+                bits = len(str(d["n"]).rstrip("=")) * 6 // 8 * 8
+            yield Finding(self.source, ASSET_KEY, AZURE_KTY[kty], loc, key_size=bits,
+                          primitive="pke" if "RSA" in kty else ("signature" if "EC" in kty else "block-cipher"),
+                          raw=kty, context={**ctx, "provider": "azure-keyvault", "curve": crv,
+                                            "ops": d.get("key_ops") or d.get("keyOps")})
+
+        # Certificados (ACM, Key Vault certs, k8s TLS...)
+        ka = d.get("KeyAlgorithm") or d.get("keyAlgorithm")
+        sig = d.get("SignatureAlgorithm") or d.get("signatureAlgorithm")
+        if isinstance(ka, str) and (sig or "Certificate" in jp or d.get("DomainName")):
+            alg, bits = _split_alg_bits(ka)
+            yield Finding(self.source, ASSET_CERTIFICATE, alg, loc, key_size=bits, primitive="signature",
+                          raw=f"{ka} / {sig}", context={**ctx, "domain": d.get("DomainName"),
+                                                        "signature_algorithm": sig,
+                                                        "not_after": d.get("NotAfter")})
+
+        # Políticas TLS de load balancers (AWS ELB SslPolicies, k8s ingress annotations...)
+        for key in ("SslPolicy", "ssl_policy", "sslPolicy", "Ciphers", "ciphers", "ssl-ciphers",
+                    "nginx.ingress.kubernetes.io/ssl-ciphers", "minTlsVersion", "min_tls_version", "SslProtocols"):
+            v = d.get(key)
+            if v is None:
+                continue
+            items = v if isinstance(v, list) else re.split(r"[:,\s]+", str(v))
+            for item in items:
+                name = item.get("Name") if isinstance(item, dict) else str(item)
+                if name:
+                    yield Finding(self.source, ASSET_PROTOCOL if "TLS" in name.upper() and "_" not in name else ASSET_ALGORITHM,
+                                  name, f"{loc}.{key}", primitive="protocol", raw=str(v)[:200],
+                                  context={**ctx, "policy_key": key})
+
+    # ---------- NGINX / HAProxy ----------
+    def _scan_proxy_conf(self, path: Path, text: str) -> Iterable[Finding]:
+        rules = [
+            (r"^\s*ssl_protocols\s+([^;]+);", "protocols"),
+            (r"^\s*ssl_ciphers\s+['\"]?([^;'\"]+)['\"]?;", "ciphers"),
+            (r"^\s*ssl_ecdh_curve\s+([^;]+);", "curves"),
+            (r"^\s*ssl_conf_command\s+Groups\s+([^;]+);", "curves"),
+            (r"^\s*ssl-default-bind-ciphers\s+(\S+)", "ciphers"),
+            (r"^\s*ssl-default-bind-ciphersuites\s+(\S+)", "ciphers"),
+            (r"^\s*ssl-default-bind-options\s+(.+)$", "protocols"),
+            (r"\bcurves\s+(\S+)", "curves"),
+            (r"^\s*ssl_certificate\s+([^;]+);", "cert"),
+            (r"\bssl\s+crt\s+(\S+)", "cert"),
+        ]
+        for rx, kind in rules:
+            for m in re.finditer(rx, text, re.M):
+                ln = text.count("\n", 0, m.start()) + 1
+                loc = f"{path}:{ln}"
+                val = m.group(1).strip()
+                if kind == "cert":
+                    yield Finding(self.source, ASSET_CERTIFICATE, "CERT_REF", loc, raw=val,
+                                  context={"cert_path": val, "server": path.name})
+                    continue
+                for tok in re.split(r"[:\s]+", val):
+                    if not tok or tok.startswith("!") or tok.startswith("-"):
+                        continue
+                    yield Finding(self.source,
+                                  ASSET_PROTOCOL if kind == "protocols" else ASSET_ALGORITHM,
+                                  tok, loc, primitive="key-agree" if kind == "curves" else "protocol",
+                                  raw=val[:200], context={"directive": kind, "server": path.name})
+
+
+def _parse_gcp(a: str) -> tuple[str, int | None, str]:
+    if a.startswith("GOOGLE_SYMMETRIC"):
+        return "AES-256-GCM", 256, "ae"
+    if a.startswith("EC_SIGN_P"):
+        m = re.search(r"P(\d+)", a)
+        return "ECDSA", int(m.group(1)) if m else None, "signature"
+    if a.startswith("EC_SIGN_ED25519"):
+        return "Ed25519", 256, "signature"
+    if a.startswith("RSA"):
+        m = re.search(r"_(\d{4})_", a + "_")
+        return "RSA", int(m.group(1)) if m else None, "signature" if "SIGN" in a else "pke"
+    if a.startswith("HMAC"):
+        return a.replace("_", "-"), None, "mac"
+    if a.startswith("PQ_SIGN_ML_DSA"):
+        return a.replace("PQ_SIGN_", "").replace("_", "-"), None, "signature"
+    if a.startswith("PQ_SIGN_SLH_DSA"):
+        return "SLH-DSA", None, "signature"
+    return a, None, "unknown"
+
+
+def _split_alg_bits(s: str) -> tuple[str, int | None]:
+    m = re.match(r"([A-Za-z]+)[_-]?(?:P)?(\d+)?", s)
+    if not m:
+        return s, None
+    alg = m.group(1).upper()
+    alg = {"EC": "ECDSA", "ECC": "ECDSA"}.get(alg, alg)
+    return alg, int(m.group(2)) if m.group(2) else None

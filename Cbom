@@ -1,0 +1,92 @@
+"""Exporta o inventário de assets (coleção Assets) para CBOM em CycloneDX 1.6.
+
+Cada asset vira um component com cryptoProperties, conforme o perfil
+criptográfico do CycloneDX 1.6 (assetType: algorithm | certificate |
+related-crypto-material | protocol).
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+SPEC_VERSION = "1.6"
+
+# asset_type interno -> assetType CycloneDX
+ASSET_TYPE_MAP = {
+    "algorithm": "algorithm",
+    "certificate": "certificate",
+    "related-crypto-material": "related-crypto-material",
+    "protocol": "protocol",
+}
+
+
+def _to_component(asset: dict[str, Any]) -> dict[str, Any]:
+    """Converte um documento da coleção Assets num component CycloneDX."""
+    asset_type = ASSET_TYPE_MAP.get(asset.get("asset_type"), "algorithm")
+
+    crypto: dict[str, Any] = {"assetType": asset_type}
+
+    if asset_type == "algorithm":
+        algo: dict[str, Any] = {}
+        if asset.get("primitive"):
+            algo["primitive"] = asset["primitive"]
+        if asset.get("algorithm"):
+            # parameterSetIdentifier leva o tamanho da chave quando existe
+            if asset.get("key_size"):
+                algo["parameterSetIdentifier"] = str(asset["key_size"])
+            algo["mode"] = asset.get("mode") or None
+            algo = {k: v for k, v in algo.items() if v is not None}
+        crypto["algorithmProperties"] = algo
+
+    if asset_type == "protocol":
+        crypto["protocolProperties"] = {"type": asset.get("algorithm")}
+
+    if asset_type == "certificate" and asset.get("key_size"):
+        crypto.setdefault("certificateProperties", {})["subjectName"] = asset.get("location")
+
+    if asset.get("nist_migration") or asset.get("risk_tier"):
+        crypto["description"] = (
+            f"riskTier={asset.get('risk_tier') or 'unknown'}"
+            + (f" | {asset['nist_migration']}" if asset.get("nist_migration") else "")
+        )
+
+    return {
+        "type": "cryptographic-asset",
+        "bom-ref": f"crypto/{asset_type}/{asset.get('fingerprint', uuid.uuid4())}",
+        "name": asset.get("algorithm", "unknown"),
+        "description": f"Detetado em {asset.get('location', '?')} (vetor: {asset.get('source', '?')})",
+        "cryptoProperties": crypto,
+        "properties": [
+            {"name": "quantum_scanner:source", "value": str(asset.get("source", ""))},
+            {"name": "quantum_scanner:location", "value": str(asset.get("location", ""))},
+            {"name": "quantum_scanner:risk_tier", "value": str(asset.get("risk_tier") or "unknown")},
+        ],
+    }
+
+
+def build_cbom(assets: list[dict[str, Any]], tool_name: str = "quantum-scanner") -> dict[str, Any]:
+    """Constrói o documento CBOM completo."""
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": SPEC_VERSION,
+        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+        "version": 1,
+        "metadata": {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tools": [{"vendor": "JunctionX", "name": tool_name}],
+        },
+        "components": [_to_component(a) for a in assets],
+    }
+
+
+def export_cbom_from_db(db, output_path: str, tool_name: str = "quantum-scanner") -> str:
+    """Lê a coleção Assets e escreve o CBOM em JSON no caminho indicado."""
+    from db import ASSETS_COLLECTION
+
+    assets = list(db[ASSETS_COLLECTION].find({}))
+    cbom = build_cbom(assets, tool_name=tool_name)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(cbom, fh, indent=2, ensure_ascii=False)
+    return output_path
