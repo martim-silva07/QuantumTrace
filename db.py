@@ -19,7 +19,7 @@ ASSETS_COLLECTION = "Assets"
 DEFAULT_URI = (
     os.environ.get("MONGODB_URI")
     or os.environ.get("MONGO_URI")
-    or "mongodb+srv://Banana:Guilherme2007@junctionx.0yole3c.mongodb.net/"
+    or "mongodb+srv://Martim:1234567890@junctionx.0yole3c.mongodb.net/"
 )
 
 
